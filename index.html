@@ -1,0 +1,271 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>Escáner de códigos</title>
+<style>
+  :root { --azul:#1565c0; --verde:#2e7d32; --gris:#f2f4f7; --texto:#1b1b1b; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: var(--gris); color: var(--texto);
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; font-size: 20px;
+    -webkit-text-size-adjust: 100%; touch-action: manipulation; }
+  main { padding: 12px; max-width: 560px; margin: 0 auto; }
+  h1 { font-size: 24px; margin: 4px 0 12px; text-align: center; }
+  .visor { position: relative; width: 100%; aspect-ratio: 3 / 4; background: #000;
+    border-radius: 16px; overflow: hidden; }
+  video { width: 100%; height: 100%; object-fit: cover; }
+  .mira { position: absolute; left: 12%; right: 12%; top: 40%; height: 20%;
+    border: 3px solid #39ff14; border-radius: 12px; pointer-events: none; }
+  .estado { min-height: 28px; text-align: center; margin: 8px 0; font-weight: 600; }
+  .btn { display: block; width: 100%; min-height: 64px; margin: 10px 0; border: 0;
+    border-radius: 14px; font-size: 22px; font-weight: 700; color: #fff; background: var(--azul); }
+  .btn.verde { background: var(--verde); }
+  .btn.gris { background: #607d8b; }
+  .btn:disabled { opacity: .5; }
+  .campo { margin: 12px 0; }
+  label { display: block; font-weight: 700; margin-bottom: 6px; }
+  input, select, textarea { width: 100%; min-height: 60px; padding: 12px; font-size: 22px;
+    border: 2px solid #b0bec5; border-radius: 12px; background: #fff; color: var(--texto); }
+  textarea { min-height: 96px; }
+  .fila { display: flex; gap: 10px; }
+  .fila > * { flex: 1; }
+  .oculto { display: none !important; }
+  .msg { padding: 14px; border-radius: 12px; font-size: 20px; text-align: center; margin: 10px 0; }
+  .ok { background: #c8e6c9; color: #1b5e20; }
+  .error { background: #ffcdd2; color: #b71c1c; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Escáner de códigos</h1>
+
+  <div class="visor">
+    <video id="video" playsinline muted autoplay></video>
+    <div class="mira"></div>
+  </div>
+  <div id="estado" class="estado">Pulsa “Activar cámara” para empezar.</div>
+
+  <button id="btnCamara" class="btn" type="button">Activar cámara</button>
+  <button id="btnEscanear" class="btn verde" type="button" disabled>Escanear código</button>
+
+  <form id="form" autocomplete="off">
+    <div class="campo">
+      <label for="tipo">Tipo</label>
+      <select id="tipo">
+        <option value="Bodega">Bodega</option>
+        <option value="Medidor">Medidor</option>
+      </select>
+    </div>
+
+    <div class="campo">
+      <label for="codigo">Código</label>
+      <input id="codigo" inputmode="numeric" placeholder="Escanea o escribe el código">
+    </div>
+
+    <div class="campo">
+      <label for="formato">Formato</label>
+      <input id="formato" readonly placeholder="EAN-13 o Code 128">
+    </div>
+
+    <div class="campo">
+      <label id="etiquetaCantidad" for="cantidad">Cantidad</label>
+      <input id="cantidad" type="number" inputmode="decimal" min="0" step="any" placeholder="0">
+    </div>
+
+    <div class="campo">
+      <label for="usuario">Usuario</label>
+      <input id="usuario" placeholder="Tu nombre">
+    </div>
+
+    <div class="campo">
+      <label for="notas">Notas</label>
+      <textarea id="notas" placeholder="Opcional"></textarea>
+    </div>
+
+    <button id="btnGuardar" class="btn verde" type="submit">Guardar</button>
+    <button id="btnLimpiar" class="btn gris" type="button">Limpiar código</button>
+  </form>
+
+  <div id="mensaje"></div>
+</main>
+
+<script src="https://unpkg.com/@zxing/library@0.21.3/umd/index.min.js"></script>
+<script>
+  // ===== Configuración =====
+  const URL_SCRIPT = 'https://script.google.com/macros/s/AKfycbw6rp4lDgppZo-25e_jWc1cTHUKVgNHFDMIcGlekEF7ws4v81Lw9dA3vAj0j-AG2Y4U/exec';
+  const TOKEN = 'MI-TOKEN';
+  const HOJA = 'Escaneos';
+
+  const $ = (id) => document.getElementById(id);
+  const video = $('video');
+  let stream = null;
+  let detector = null;      // BarcodeDetector nativo (Android/Chrome)
+  let zxingReader = null;   // ZXing (iPhone / respaldo)
+  let zxingControls = null;
+  let buscando = false;
+  let timer = null;
+
+  // Recordar usuario entre sesiones
+  try { $('usuario').value = localStorage.getItem('usuario') || ''; } catch (e) {}
+  $('usuario').addEventListener('change', () => {
+    try { localStorage.setItem('usuario', $('usuario').value.trim()); } catch (e) {}
+  });
+
+  function estado(texto) { $('estado').textContent = texto; }
+  function mensaje(texto, tipo) {
+    $('mensaje').innerHTML = '<div class="msg ' + tipo + '"></div>';
+    $('mensaje').firstChild.textContent = texto;
+  }
+
+  // ===== Tipo: etiqueta de cantidad / lectura =====
+  function actualizarTipo() {
+    const medidor = $('tipo').value === 'Medidor';
+    $('etiquetaCantidad').textContent = medidor ? 'Lectura' : 'Cantidad';
+    $('cantidad').placeholder = medidor ? 'Lectura del medidor' : '0';
+  }
+  $('tipo').addEventListener('change', actualizarTipo);
+  actualizarTipo();
+
+  // ===== Formato según el valor leído =====
+  function formatoDe(valor) {
+    return /^\d{13}$/.test(valor) ? 'EAN-13' : 'Code 128';
+  }
+
+  function alDetectar(valor) {
+    if (!valor) return;
+    $('codigo').value = valor;
+    $('formato').value = formatoDe(valor);
+    detenerBusqueda();
+    if (navigator.vibrate) navigator.vibrate(120);
+    estado('Código leído: ' + valor);
+    $('btnEscanear').textContent = 'Escanear otro código';
+    $('btnEscanear').disabled = false;
+  }
+
+  // ===== Cámara trasera =====
+  async function activarCamara() {
+    if (stream) return;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } },
+        audio: false
+      });
+      video.srcObject = stream;
+      await video.play();
+      $('btnCamara').textContent = 'Cámara activa';
+      $('btnCamara').disabled = true;
+      $('btnEscanear').disabled = false;
+      estado('Apunta el código dentro del recuadro y pulsa “Escanear código”.');
+    } catch (err) {
+      estado('No se pudo abrir la cámara. Revisa los permisos del navegador (usa HTTPS).');
+    }
+  }
+
+  // ===== Escaneo =====
+  function iniciarBusqueda() {
+    if (buscando || !stream) return;
+    buscando = true;
+    $('btnEscanear').disabled = true;
+    estado('Buscando código…');
+
+    if ('BarcodeDetector' in window) {
+      // Android / Chrome: API nativa
+      detector = detector || new BarcodeDetector({ formats: ['ean_13', 'code_128'] });
+      timer = setInterval(async () => {
+        try {
+          const codigos = await detector.detect(video);
+          if (codigos.length) alDetectar(codigos[0].rawValue);
+        } catch (e) {}
+      }, 250);
+    } else if (window.ZXing) {
+      // iPhone / Safari: ZXing
+      const pistas = new Map();
+      pistas.set(ZXing.DecodeHintType.POSSIBLE_FORMATS, [
+        ZXing.BarcodeFormat.EAN_13, ZXing.BarcodeFormat.CODE_128
+      ]);
+      zxingReader = zxingReader || new ZXing.BrowserMultiFormatReader(pistas, 300);
+      zxingReader.decodeFromVideoElement(video, (resultado) => {
+        if (resultado) alDetectar(resultado.getText());
+      }).then((c) => { zxingControls = c; }).catch(() => {
+        estado('No se pudo iniciar el lector. Escribe el código a mano.');
+        detenerBusqueda();
+      });
+    } else {
+      estado('Este navegador no puede escanear. Escribe el código a mano.');
+      buscando = false;
+      $('btnEscanear').disabled = false;
+    }
+  }
+
+  function detenerBusqueda() {
+    buscando = false;
+    if (timer) { clearInterval(timer); timer = null; }
+    if (zxingControls) { try { zxingControls.stop(); } catch (e) {} zxingControls = null; }
+    $('btnEscanear').disabled = false;
+  }
+
+  $('btnCamara').addEventListener('click', activarCamara);
+  $('btnEscanear').addEventListener('click', () => {
+    if (buscando) { detenerBusqueda(); estado('Escaneo detenido.'); return; }
+    $('btnEscanear').textContent = 'Detener escaneo';
+    iniciarBusqueda();
+  });
+  $('btnLimpiar').addEventListener('click', () => {
+    $('codigo').value = '';
+    $('formato').value = '';
+    mensaje('', '');
+    $('mensaje').innerHTML = '';
+  });
+
+  // ===== Guardar: envía al Apps Script =====
+  $('form').addEventListener('submit', async (ev) => {
+    ev.preventDefault();
+    const codigo = $('codigo').value.trim();
+    const cantidad = $('cantidad').value.trim();
+    const usuario = $('usuario').value.trim();
+
+    if (!codigo) { mensaje('Falta el código.', 'error'); return; }
+    if (!cantidad) { mensaje($('tipo').value === 'Medidor' ? 'Falta la lectura.' : 'Falta la cantidad.', 'error'); return; }
+    if (!usuario) { mensaje('Escribe tu usuario.', 'error'); return; }
+
+    const datos = {
+      token: TOKEN,
+      hoja: HOJA,
+      tipo: $('tipo').value,
+      codigo: codigo,
+      formato: $('formato').value || formatoDe(codigo),
+      cantidad: cantidad,
+      usuario: usuario,
+      notas: $('notas').value.trim()
+    };
+
+    $('btnGuardar').disabled = true;
+    mensaje('Guardando…', 'ok');
+    try {
+      const resp = await fetch(URL_SCRIPT, {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+        body: JSON.stringify(datos)
+      });
+      const json = await resp.json();
+      if (json.ok) {
+        mensaje('Guardado correctamente.', 'ok');
+        $('codigo').value = '';
+        $('formato').value = '';
+        $('cantidad').value = '';
+        $('notas').value = '';
+        estado('Listo para el siguiente código.');
+      } else {
+        mensaje('No se guardó: ' + (json.error || 'error desconocido'), 'error');
+      }
+    } catch (err) {
+      mensaje('Error de conexión. Revisa tu red e inténtalo de nuevo.', 'error');
+    } finally {
+      $('btnGuardar').disabled = false;
+    }
+  });
+</script>
+</body>
+</html>
